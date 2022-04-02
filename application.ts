@@ -1,9 +1,11 @@
 import { EventEmitter } from 'events';
-import debug from 'debug';
+const debug = require('debug')('koa:application')
 import only from 'only';
 import onFinished from 'on-finished';
+import Stream from 'stream';
 import http from 'http';
 import util from 'util';
+import statuses from 'statuses';
 import compose from './compose';
 
 interface IAppOptions {
@@ -16,12 +18,31 @@ interface IAppOptions {
 }
 
 export default class Application extends EventEmitter {
-  readonly proxy: boolean;
-  readonly subdomainOffset: number;
-  readonly proxyIpHeader: string;
-  readonly maxIpsCount: number;
+  /**
+   * Environment, default to 'development'
+   */
   readonly env: string;
+  /**
+   * Signed cookie keys
+   */
   readonly keys?: string[];
+  /**
+   * Trust proxy headers, default to false
+   */
+  readonly proxy: boolean;
+  /**
+   * Subdomain offset, default to 2
+   */
+  readonly subdomainOffset: number;
+  /**
+   * Proxy IP header, defaults to 'X-Forwarded-For'
+   */
+  readonly proxyIpHeader: string;
+  /**
+   * Max IPs read from proxy IP header, default to 0 (means infinity)
+   */
+  readonly maxIpsCount: number;
+
   readonly middleware: Function[];
 
   public silent: boolean = false;
@@ -37,9 +58,13 @@ export default class Application extends EventEmitter {
     if (options.keys) this.keys = options.keys
     this.middleware = []
     // TODO:
+    if (util.inspect.custom) {
+      this[util.inspect.custom] = this.inspect;
+    }
   }
 
   listen(...args) {
+    debug('listen');
     const server = http.createServer(this.callback());
     return server.listen(...args);
   }
@@ -58,6 +83,8 @@ export default class Application extends EventEmitter {
 
   use(fn: Function) {
     if (typeof fn !== 'function') throw new TypeError('middleware must be a function!');
+    // @ts-ignore
+    debug('use %s', fn._name || fn.name || '-');
     this.middleware.push(fn);
     return this;
   }
@@ -107,5 +134,59 @@ export default class Application extends EventEmitter {
 }
 
 function respond(ctx) {
-  // TODO:
+  if (ctx.respond === false) return;
+
+  if (!ctx.writable) return;
+
+  const res = ctx.res;
+  let body = ctx.body;
+  const code = ctx.status;
+
+  // ignore body
+  if (statuses.empty[code]) {
+    // strip headers
+    ctx.body = null;
+    return res.end();
+  }
+
+  if (ctx.method === 'HEAD') {
+    if (!res.headersSent && !ctx.response.has('Content-Length')) {
+      const { length } = ctx.response;
+
+      if (Number.isInteger(length)) ctx.length = length;
+    }
+    return res.end();
+  }
+
+  // status body
+  if (body == null) {
+    if (ctx.response._explicitNullBody) {
+      ctx.response.remove('Content-Type');
+      ctx.response.remove('Transfer-Encoding');
+      ctx.length = 0;
+      return res.end();
+    }
+    if (ctx.req.httpVersionMajor >= 2) {
+      body = String(code);
+    } else {
+      body = ctx.message || String(code);
+    }
+    if (!res.headersSent) {
+      ctx.type = 'text';
+      ctx.length = Buffer.byteLength(body);
+    }
+    return res.end(body);
+  }
+
+  // responses
+  if (Buffer.isBuffer(body)) return res.end(body);
+  if (typeof body === 'string') return res.end(body);
+  if (body instanceof Stream) return body.pipe(res);
+
+  // body: json
+  body = JSON.stringify(body);
+  if (!res.headersSent) {
+    ctx.length = Buffer.byteLength(body);
+  }
+  res.end(body);
 }
